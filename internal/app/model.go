@@ -77,6 +77,7 @@ type runtimeStartedMsg struct{ err error }
 type animationTickMsg struct{}
 type sessionStartedMsg struct {
 	id                string
+	resumed           bool
 	providerSessionID string
 	err               error
 }
@@ -108,7 +109,7 @@ func New() tea.Model {
 		status:            "booting",
 		cwd:               cwd,
 		mode:              agents.ModeBuild,
-		policy:            state.ApprovalConservative,
+		policy:            state.ApprovalAllowAll,
 		modelName:         "gpt-5",
 		toolCalls:         map[string]string{},
 		collapsedExecs:    map[string]bool{},
@@ -148,6 +149,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.newSessionCmd(), m.loadSessionsCmd(), m.loadModelsCmd(), m.waitForRuntimeEvent())
 	case sessionStartedMsg:
 		if msg.err != nil {
+			m.pendingPrompt = false
 			m.errorText = msg.err.Error()
 			m.status = "session error"
 			m.refreshPaneContent(false)
@@ -155,6 +157,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.localSessionID = msg.id
 		m.sessionID = msg.providerSessionID
+		m.pendingPrompt = false
 		m.status = "session ready"
 		_ = m.store.UpdateSession(m.localSessionID, func(meta *sessionstore.SessionMeta) {
 			meta.ProviderSessionID = msg.providerSessionID
@@ -191,6 +194,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshPaneContent(false)
 		if msg.meta.ProviderSessionID != "" {
 			m.appendActivity("sessions", fmt.Sprintf("loaded local session %s", msg.meta.LocalID), "attempting provider resume next time /resume is invoked", "ready")
+			m.refreshPaneContent(true)
 		}
 	case modelSwitchedMsg:
 		if msg.err != nil {
@@ -206,8 +210,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.consumeRuntimeEvent(msg.event)
 		return m, m.waitForRuntimeEvent()
 	case promptSentMsg:
-		m.pendingPrompt = false
 		if msg.err != nil {
+			m.pendingPrompt = false
 			m.errorText = msg.err.Error()
 			m.status = "send failed"
 		}
@@ -275,12 +279,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "shift+pgdown":
 			m.activityVP.HalfViewDown()
 			return m, nil
-		case "wheelup":
-			m.scrollHoveredViewport(true)
-			return m, nil
-		case "wheeldown":
-			m.scrollHoveredViewport(false)
-			return m, nil
 		case "tab":
 			if !m.runtimeReady || m.pendingPrompt {
 				return m, nil
@@ -303,12 +301,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(m.resumeLatestCmd(), m.loadSessionsCmd())
 			}
 		case "ctrl+l":
-			m.transcript = nil
-			m.activity = nil
-			m.toolCalls = map[string]string{}
-			m.collapsedExecs = map[string]bool{}
-			m.transcriptToggles = map[int]string{}
-			m.errorText = ""
+			m.clearLocalPanes()
 			m.refreshPaneContent(false)
 			return m, nil
 		case "ctrl+a":
@@ -428,8 +421,11 @@ func (m *model) resumeLatestCmd() tea.Cmd {
 		if latest == nil {
 			return sessionStartedMsg{err: fmt.Errorf("no previous local session found")}
 		}
-		providerID, err := m.runtime.ResumeLatest(m.ctx)
-		return sessionStartedMsg{id: latest.ID, providerSessionID: providerID, err: err}
+		if latest.ProviderSessionID == "" {
+			return sessionStartedMsg{err: fmt.Errorf("latest saved session has no provider session id")}
+		}
+		providerID, err := m.runtime.ResumeSession(m.ctx, latest.ProviderSessionID)
+		return sessionStartedMsg{id: latest.ID, resumed: true, providerSessionID: providerID, err: err}
 	}
 }
 
@@ -544,9 +540,7 @@ func (m *model) runSlashCommandCmd(raw string) tea.Cmd {
 		m.appendActivity("command", "/approvals", fmt.Sprintf("approval policy set to %s", m.policy), "ready")
 		return nil
 	case "clear":
-		m.transcript = nil
-		m.activity = nil
-		m.errorText = ""
+		m.clearLocalPanes()
 		m.appendActivity("command", "/clear", "cleared local transcript and activity panes", "ready")
 		m.refreshPaneContent(false)
 		return nil
@@ -601,6 +595,9 @@ func (m *model) applyEvent(when time.Time, event copilotbridge.AppEvent) {
 	case "assistant_delta":
 		m.appendAssistantDelta(event.Text)
 		m.status = event.Status
+	case "turn":
+		m.pendingPrompt = event.Status == "running"
+		m.status = event.Status
 	case "assistant":
 		m.replaceLatestAssistant(event.Text)
 		m.status = event.Status
@@ -617,6 +614,12 @@ func (m *model) applyEvent(when time.Time, event copilotbridge.AppEvent) {
 	case "intent", "tool", "tool_progress", "tool_result", "permission", "permission_result", "subagent", "subagent_result", "subagent_failed":
 		if event.Kind == "tool" && event.Ref != "" {
 			m.toolCalls[event.Ref] = event.Text
+		}
+		if event.Kind == "permission_result" {
+			m.resolvePermissionBlock(event)
+			m.appendActivity(event.Kind, event.Text, event.Detail, event.Status)
+			m.status = event.Status
+			break
 		}
 		m.appendTranscriptEntryAt(when, "", event.Kind, event.Ref, event.Text, event.Detail, event.Status)
 		m.appendActivity(event.Kind, event.Text, event.Detail, event.Status)
@@ -842,6 +845,7 @@ func (m *model) restoreStoredSession(meta sessionstore.SessionMeta, events []ses
 		m.applyEvent(event.Timestamp, copilotbridge.AppEvent{
 			Kind:    event.Kind,
 			Ref:     event.Ref,
+			Parent:  "",
 			Text:    event.Text,
 			Detail:  event.Detail,
 			Status:  event.Status,
@@ -852,6 +856,37 @@ func (m *model) restoreStoredSession(meta sessionstore.SessionMeta, events []ses
 		}
 	}
 	m.status = "session loaded"
+	m.pendingPrompt = false
+}
+
+func (m *model) clearLocalPanes() {
+	m.transcript = nil
+	m.activity = nil
+	m.toolCalls = map[string]string{}
+	m.collapsedExecs = map[string]bool{}
+	m.transcriptToggles = map[int]string{}
+	m.errorText = ""
+}
+
+func (m *model) resolvePermissionBlock(event copilotbridge.AppEvent) {
+	if event.Ref == "" {
+		return
+	}
+	for i := len(m.transcript) - 1; i >= 0; i-- {
+		entry := &m.transcript[i]
+		if entry.Kind != "permission" || entry.ID != event.Ref {
+			continue
+		}
+		entry.Status = event.Status
+		if event.Text != "" {
+			if entry.Detail != "" {
+				entry.Detail += " | " + event.Text
+			} else {
+				entry.Detail = event.Text
+			}
+		}
+		return
+	}
 }
 
 func (m *model) toggleTranscriptBlockAt(x, y int) bool {
@@ -884,17 +919,6 @@ func (m *model) executionCollapsed(groupID string) bool {
 
 func (m *model) isWorking() bool {
 	return m.pendingPrompt || m.status == "sending" || m.status == "running" || m.status == "blocked"
-}
-
-func (m *model) scrollHoveredViewport(up bool) {
-	if m.activityRect.contains(0, 0) {
-		return
-	}
-	if up {
-		m.transcriptVP.LineUp(3)
-		return
-	}
-	m.transcriptVP.LineDown(3)
 }
 
 func (m *model) scrollViewportAt(x, y int, up bool) {

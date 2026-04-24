@@ -10,7 +10,7 @@
 - Supports `build` and `plan` agent presets for new sessions
 - Supports new session and resume-latest session flows
 - Shows permission requests and outcomes in the activity feed
-- Exposes a conservative approval policy and an allow-all toggle
+- Exposes an allow-all default policy and a conservative toggle
 
 ## Requirements
 
@@ -57,7 +57,7 @@ sysiphus
 - `Ctrl+N`: new session
 - `Ctrl+R`: resume latest session
 - `Ctrl+P`: toggle `build` / `plan` mode for new sessions
-- `Ctrl+A`: toggle approval policy between `conservative` and `allow-all`
+- `Ctrl+A`: toggle approval policy between `allow-all` and `conservative`
 - `Ctrl+L`: clear local panes
 - `?`: help
 - `Ctrl+C`: quit
@@ -78,7 +78,7 @@ sysiphus
 
 ## Notes
 
-- The default `conservative` approval flow now allows normal workspace edits and common development tools while still blocking obviously high-risk system commands. `allow-all` removes those guardrails.
+- The default approval flow is `allow-all` so normal tool use proceeds without extra friction. `conservative` is the opt-in guarded mode that still blocks obviously high-risk system commands.
 - Permission events are shown in the UI so the next iteration can turn them into a true interactive approval modal.
 - Because the Copilot SDK is still preview, `internal/copilot` keeps the SDK-specific integration isolated from the TUI state.
 - Agent switching currently creates a new session because this MVP binds the selected custom agent at session creation time.

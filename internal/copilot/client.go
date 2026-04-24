@@ -32,6 +32,7 @@ type Runtime struct {
 type AppEvent struct {
 	Kind    string
 	Ref     string
+	Parent  string
 	Text    string
 	Detail  string
 	Status  string
@@ -42,7 +43,7 @@ func NewRuntime() *Runtime {
 	return &Runtime{
 		events:         make(chan AppEvent, 512),
 		mode:           agents.ModeBuild,
-		approvalPolicy: state.ApprovalConservative,
+		approvalPolicy: state.ApprovalAllowAll,
 	}
 }
 
@@ -95,7 +96,7 @@ func (r *Runtime) Start(ctx context.Context, cwd string) error {
 	r.ctx = ctx
 	r.cwd = cwd
 	r.client = client
-	r.publish("status", "Connected to Copilot runtime", "", "ready", "")
+	r.publish("status", "Connected to Copilot runtime", "", "ready", "", "")
 	return nil
 }
 
@@ -158,28 +159,24 @@ func (r *Runtime) NewSession(ctx context.Context, cwd string, model string) (str
 	}
 	r.session = sess
 	r.sessionID = sess.SessionID
-	r.publish("status", fmt.Sprintf("Started session with model %s", resolvedModel), sess.SessionID, "ready", "")
+	r.publish("status", fmt.Sprintf("Started session with model %s", resolvedModel), sess.SessionID, "ready", "", "")
 	return sess.SessionID, nil
 }
 
-func (r *Runtime) ResumeLatest(ctx context.Context) (string, error) {
+func (r *Runtime) ResumeSession(ctx context.Context, sessionID string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.client == nil {
 		return "", errors.New("runtime not started")
 	}
-	id, err := r.client.GetLastSessionID(ctx)
-	if err != nil {
-		return "", err
-	}
-	if id == nil || *id == "" {
-		return "", errors.New("no previous session found")
+	if strings.TrimSpace(sessionID) == "" {
+		return "", errors.New("no provider session id available")
 	}
 	if r.session != nil {
 		_ = r.session.Disconnect()
 		r.session = nil
 	}
-	sess, err := r.client.ResumeSession(ctx, *id, &copilot.ResumeSessionConfig{
+	sess, err := r.client.ResumeSession(ctx, sessionID, &copilot.ResumeSessionConfig{
 		Streaming:           true,
 		OnPermissionRequest: approvalHandler(r.approvalPolicy),
 	})
@@ -189,7 +186,7 @@ func (r *Runtime) ResumeLatest(ctx context.Context) (string, error) {
 	sess.On(r.handleEvent)
 	r.session = sess
 	r.sessionID = sess.SessionID
-	r.publish("status", "Resumed session", sess.SessionID, "ready", "")
+	r.publish("status", "Resumed session", sess.SessionID, "ready", "", "")
 	return sess.SessionID, nil
 }
 
@@ -259,7 +256,7 @@ func (r *Runtime) SwitchModel(ctx context.Context, modelID string) error {
 	if err := sess.SetModel(ctx, modelID, nil); err != nil {
 		return err
 	}
-	r.publish("status", fmt.Sprintf("Switching model to %s", modelID), "", "running", "")
+	r.publish("status", fmt.Sprintf("Switching model to %s", modelID), "", "running", "", "")
 	return nil
 }
 
@@ -299,21 +296,25 @@ func approvalHandler(policy state.ApprovalPolicy) copilot.PermissionHandlerFunc 
 func (r *Runtime) handleEvent(event copilot.SessionEvent) {
 	switch data := event.Data.(type) {
 	case *copilot.UserMessageData:
-		r.publish("user", data.Content, "", "ready", "")
+		r.publish("user", data.Content, "", "ready", "", "")
 	case *copilot.AssistantReasoningDeltaData:
-		r.publish("reasoning_delta", data.DeltaContent, "", "running", data.ReasoningID)
+		r.publish("reasoning_delta", data.DeltaContent, "", "running", data.ReasoningID, "")
 	case *copilot.AssistantReasoningData:
-		r.publish("reasoning", data.Content, "", "running", data.ReasoningID)
+		r.publish("reasoning", data.Content, "", "running", data.ReasoningID, "")
+	case *copilot.AssistantTurnStartData:
+		r.publish("turn", "turn started", "", "running", data.TurnID, "")
 	case *copilot.AssistantMessageDeltaData:
-		r.publish("assistant_delta", data.DeltaContent, "", "running", data.MessageID)
+		r.publish("assistant_delta", data.DeltaContent, "", "running", data.MessageID, requestRef(data.ParentToolCallID))
 	case *copilot.AssistantMessageData:
-		r.publish("assistant", data.Content, "", "ready", data.MessageID)
+		r.publish("assistant", data.Content, "", "ready", data.MessageID, requestRef(data.ParentToolCallID))
+	case *copilot.AssistantTurnEndData:
+		r.publish("turn", "turn complete", "", "ready", data.TurnID, "")
 	case *copilot.AssistantIntentData:
-		r.publish("intent", data.Intent, "", "running", "")
+		r.publish("intent", data.Intent, "", "running", "", "")
 	case *copilot.ToolExecutionStartData:
-		r.publish("tool", data.ToolName, formatToolDetail(data.Arguments, data.McpServerName), "running", data.ToolCallID)
+		r.publish("tool", data.ToolName, formatToolDetail(data.Arguments, data.McpServerName), "running", data.ToolCallID, requestRef(data.ParentToolCallID))
 	case *copilot.ToolExecutionProgressData:
-		r.publish("tool_progress", data.ProgressMessage, "", "running", data.ToolCallID)
+		r.publish("tool_progress", data.ProgressMessage, "", "running", data.ToolCallID, "")
 	case *copilot.ToolExecutionCompleteData:
 		text := "completed"
 		detail := ""
@@ -328,37 +329,38 @@ func (r *Runtime) handleEvent(event copilot.SessionEvent) {
 			text = "failed"
 			status = "error"
 		}
-		r.publish("tool_result", text, detail, status, data.ToolCallID)
+		r.publish("tool_result", text, detail, status, data.ToolCallID, requestRef(data.ParentToolCallID))
 	case *copilot.PermissionRequestedData:
-		r.publish("permission", fmt.Sprintf("requested %s permission", data.PermissionRequest.Kind), describePermission(data.PermissionRequest), "blocked", requestRef(data.PermissionRequest.ToolCallID))
+		toolCallID := requestRef(data.PermissionRequest.ToolCallID)
+		r.publish("permission", fmt.Sprintf("requested %s permission", data.PermissionRequest.Kind), describePermission(data.PermissionRequest), "blocked", toolCallID, toolCallID)
 	case *copilot.PermissionCompletedData:
-		r.publish("permission_result", fmt.Sprintf("permission %s", data.Result.Kind), data.RequestID, permissionStatus(data.Result.Kind), "")
+		r.publish("permission_result", fmt.Sprintf("permission %s", data.Result.Kind), data.RequestID, permissionStatus(data.Result.Kind), data.RequestID, data.RequestID)
 	case *copilot.SubagentSelectedData:
-		r.publish("subagent", fmt.Sprintf("selected %s", data.AgentDisplayName), strings.Join(data.Tools, ", "), "running", data.AgentName)
+		r.publish("subagent", fmt.Sprintf("selected %s", data.AgentDisplayName), strings.Join(data.Tools, ", "), "running", data.AgentName, "")
 	case *copilot.SubagentStartedData:
-		r.publish("subagent", fmt.Sprintf("%s started", data.AgentDisplayName), data.AgentDescription, "running", data.ToolCallID)
+		r.publish("subagent", fmt.Sprintf("%s started", data.AgentDisplayName), data.AgentDescription, "running", data.ToolCallID, data.ToolCallID)
 	case *copilot.SubagentCompletedData:
-		r.publish("subagent_result", fmt.Sprintf("%s completed", data.AgentDisplayName), describeSubagentTotals(data.Model, data.TotalToolCalls, data.TotalTokens, data.DurationMs), "ready", data.ToolCallID)
+		r.publish("subagent_result", fmt.Sprintf("%s completed", data.AgentDisplayName), describeSubagentTotals(data.Model, data.TotalToolCalls, data.TotalTokens, data.DurationMs), "ready", data.ToolCallID, data.ToolCallID)
 	case *copilot.SubagentFailedData:
-		r.publish("subagent_failed", fmt.Sprintf("%s failed", data.AgentDisplayName), joinNonEmpty([]string{data.Error, describeSubagentTotals(data.Model, data.TotalToolCalls, data.TotalTokens, data.DurationMs)}, " | "), "error", data.ToolCallID)
+		r.publish("subagent_failed", fmt.Sprintf("%s failed", data.AgentDisplayName), joinNonEmpty([]string{data.Error, describeSubagentTotals(data.Model, data.TotalToolCalls, data.TotalTokens, data.DurationMs)}, " | "), "error", data.ToolCallID, data.ToolCallID)
 	case *copilot.SessionContextChangedData:
 		branch := ""
 		if data.Branch != nil {
 			branch = *data.Branch
 		}
-		r.publish("context", data.Cwd, branch, "ready", "")
+		r.publish("context", data.Cwd, branch, "ready", "", "")
 	case *copilot.SessionUsageInfoData:
-		r.publish("usage", fmt.Sprintf("%.0f / %.0f tokens", data.CurrentTokens, data.TokenLimit), fmt.Sprintf("messages %.0f", data.MessagesLength), "ready", "")
+		r.publish("usage", fmt.Sprintf("%.0f / %.0f tokens", data.CurrentTokens, data.TokenLimit), fmt.Sprintf("messages %.0f", data.MessagesLength), "ready", "", "")
 	case *copilot.SessionModelChangeData:
 		reasoning := ""
 		if data.ReasoningEffort != nil {
 			reasoning = *data.ReasoningEffort
 		}
-		r.publish("model", data.NewModel, reasoning, "ready", "")
+		r.publish("model", data.NewModel, reasoning, "ready", "", "")
 	case *copilot.SessionErrorData:
-		r.publish("error", data.Message, "", "error", "")
+		r.publish("error", data.Message, "", "error", "", "")
 	case *copilot.SessionIdleData:
-		r.publish("idle", "Session idle", "", "ready", "")
+		r.publish("idle", "Session idle", "", "ready", "", "")
 	}
 }
 
@@ -382,13 +384,13 @@ func describePermission(req copilot.PermissionRequestedDataPermissionRequest) st
 	return strings.Join(parts, " | ")
 }
 
-func (r *Runtime) publish(kind, text, detail, status, ref string) {
+func (r *Runtime) publish(kind, text, detail, status, ref, parent string) {
 	select {
-	case r.events <- AppEvent{Kind: kind, Ref: ref, Text: text, Detail: detail, Status: status, Session: r.sessionID}:
+	case r.events <- AppEvent{Kind: kind, Ref: ref, Parent: parent, Text: text, Detail: detail, Status: status, Session: r.sessionID}:
 	default:
 		go func() {
 			select {
-			case r.events <- AppEvent{Kind: kind, Ref: ref, Text: text, Detail: detail, Status: status, Session: r.sessionID}:
+			case r.events <- AppEvent{Kind: kind, Ref: ref, Parent: parent, Text: text, Detail: detail, Status: status, Session: r.sessionID}:
 			case <-time.After(50 * time.Millisecond):
 			}
 		}()

@@ -33,8 +33,8 @@ func helpText() string {
 		"Ctrl+N start a new session\n" +
 		"Ctrl+R resume the latest session\n" +
 		"Ctrl+P toggle plan/build mode for new sessions\n" +
-		"Ctrl+A toggle approval policy between conservative and allow-all\n" +
-		"Conservative allows normal edits and dev tools but still blocks high-risk system commands\n" +
+		"Ctrl+A toggle approval policy between allow-all and conservative\n" +
+		"Allow-all is the default; conservative keeps guardrails on higher-risk system commands\n" +
 		"Ctrl+L clear local transcript and activity panes\n" +
 		"\nCommands\n" +
 		"/new start a fresh session\n" +
