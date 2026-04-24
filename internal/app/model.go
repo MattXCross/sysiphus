@@ -283,13 +283,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !m.runtimeReady || m.pendingPrompt {
 				return m, nil
 			}
-			if m.mode == agents.ModeBuild {
-				m.mode = agents.ModePlan
-			} else {
-				m.mode = agents.ModeBuild
-			}
-			m.runtime.SetMode(m.mode)
-			m.appendActivity("mode", fmt.Sprintf("switched to %s agent", m.mode), "starting a new session for the selected mode", "ready")
+			m.setModeDefaults(nextMode(m.mode))
+			m.appendActivity("mode", fmt.Sprintf("switched to %s agent", m.mode), fmt.Sprintf("starting a new session with %s approvals", m.policy), "running")
 			m.refreshPaneContent(true)
 			return m, tea.Batch(m.newSessionCmd(), m.loadSessionsCmd())
 		case "ctrl+n":
@@ -311,26 +306,38 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.policy = state.ApprovalConservative
 			}
 			m.runtime.SetApprovalPolicy(m.policy)
-			m.appendActivity("policy", fmt.Sprintf("approval policy set to %s", m.policy), "", "ready")
+			detail := ""
+			if m.runtimeReady && m.sessionID != "" {
+				detail = "reconnecting active session so the new policy takes effect"
+				m.appendActivity("policy", fmt.Sprintf("approval policy set to %s", m.policy), detail, "running")
+				m.refreshPaneContent(true)
+				return m, m.refreshActiveSessionCmd()
+			}
+			m.appendActivity("policy", fmt.Sprintf("approval policy set to %s", m.policy), detail, "ready")
 			m.refreshPaneContent(true)
 			return m, nil
 		case "ctrl+p":
-			if m.mode == agents.ModeBuild {
-				m.mode = agents.ModePlan
-			} else {
-				m.mode = agents.ModeBuild
+			m.setModeDefaults(nextMode(m.mode))
+			detail := fmt.Sprintf("new sessions use %s approvals", m.policy)
+			if m.runtimeReady && m.sessionID != "" {
+				detail = fmt.Sprintf("reconnecting active session with %s approvals", m.policy)
+				m.appendActivity("mode", fmt.Sprintf("agent mode set to %s", m.mode), detail, "running")
+				m.refreshPaneContent(true)
+				return m, m.refreshActiveSessionCmd()
 			}
-			m.runtime.SetMode(m.mode)
-			m.appendActivity("mode", fmt.Sprintf("agent mode set to %s", m.mode), "new sessions use this mode", "ready")
+			m.appendActivity("mode", fmt.Sprintf("agent mode set to %s", m.mode), detail, "ready")
 			m.refreshPaneContent(true)
 			return m, nil
 		case "enter":
 			prompt := strings.TrimSpace(m.input.Value())
-			if prompt == "" || !m.runtimeReady || m.sessionID == "" || m.pendingPrompt {
+			if prompt == "" {
 				return m, nil
 			}
 			if strings.HasPrefix(prompt, "/") {
 				return m, m.runSlashCommandCmd(prompt)
+			}
+			if !m.runtimeReady || m.sessionID == "" || m.pendingPrompt {
+				return m, nil
 			}
 			m.pendingPrompt = true
 			m.status = "sending"
@@ -396,17 +403,19 @@ func (m *model) startRuntimeCmd() tea.Cmd {
 func (m *model) newSessionCmd() tea.Cmd {
 	mode := m.mode
 	modelName := m.modelName
+	policy := m.policy
 	return func() tea.Msg {
 		meta, err := m.store.CreateSession(sessionstore.SessionMeta{
 			Provider:       "copilot",
 			Model:          modelName,
 			Mode:           mode,
-			ApprovalPolicy: m.policy,
+			ApprovalPolicy: policy,
 		})
 		if err != nil {
 			return sessionStartedMsg{err: err}
 		}
 		m.runtime.SetMode(mode)
+		m.runtime.SetApprovalPolicy(policy)
 		providerID, err := m.runtime.NewSession(m.ctx, m.cwd, modelName)
 		return sessionStartedMsg{id: meta.LocalID, providerSessionID: providerID, err: err}
 	}
@@ -456,6 +465,22 @@ func (m *model) sendPromptCmd(prompt string) tea.Cmd {
 	}
 }
 
+func (m *model) refreshActiveSessionCmd() tea.Cmd {
+	localID := m.localSessionID
+	providerID := m.sessionID
+	mode := m.mode
+	policy := m.policy
+	return func() tea.Msg {
+		if providerID == "" {
+			return sessionStartedMsg{err: fmt.Errorf("no active provider session to refresh")}
+		}
+		m.runtime.SetMode(mode)
+		m.runtime.SetApprovalPolicy(policy)
+		resumedID, err := m.runtime.ResumeSession(m.ctx, providerID)
+		return sessionStartedMsg{id: localID, resumed: true, providerSessionID: resumedID, err: err}
+	}
+}
+
 func (m *model) switchModelCmd(modelID string) tea.Cmd {
 	return func() tea.Msg {
 		return modelSwitchedMsg{modelID: modelID, err: m.runtime.SwitchModel(m.ctx, modelID)}
@@ -494,13 +519,11 @@ func (m *model) runSlashCommandCmd(raw string) tea.Cmd {
 		m.refreshPaneContent(true)
 		return m.loadModelsCmd()
 	case "plan":
-		m.mode = agents.ModePlan
-		m.runtime.SetMode(m.mode)
+		m.setModeDefaults(agents.ModePlan)
 		m.appendActivity("command", "/plan", "switching to the plan agent and starting a fresh session", "ready")
 		return tea.Batch(m.newSessionCmd(), m.loadSessionsCmd())
 	case "build":
-		m.mode = agents.ModeBuild
-		m.runtime.SetMode(m.mode)
+		m.setModeDefaults(agents.ModeBuild)
 		m.appendActivity("command", "/build", "switching to the build agent and starting a fresh session", "ready")
 		return tea.Batch(m.newSessionCmd(), m.loadSessionsCmd())
 	case "mode":
@@ -515,8 +538,7 @@ func (m *model) runSlashCommandCmd(raw string) tea.Cmd {
 			m.refreshPaneContent(true)
 			return nil
 		}
-		m.mode = wanted
-		m.runtime.SetMode(m.mode)
+		m.setModeDefaults(wanted)
 		m.appendActivity("command", "/mode", fmt.Sprintf("switched to %s and started a fresh session", m.mode), "ready")
 		return tea.Batch(m.newSessionCmd(), m.loadSessionsCmd())
 	case "approvals":
@@ -537,7 +559,15 @@ func (m *model) runSlashCommandCmd(raw string) tea.Cmd {
 			return nil
 		}
 		m.runtime.SetApprovalPolicy(m.policy)
-		m.appendActivity("command", "/approvals", fmt.Sprintf("approval policy set to %s", m.policy), "ready")
+		detail := ""
+		if m.runtimeReady && m.sessionID != "" {
+			detail = "reconnecting active session so the new policy takes effect"
+			m.appendActivity("command", "/approvals", fmt.Sprintf("approval policy set to %s", m.policy), "running")
+			m.refreshPaneContent(true)
+			return m.refreshActiveSessionCmd()
+		}
+		m.appendActivity("command", fmt.Sprintf("approval policy set to %s", m.policy), detail, "ready")
+		m.refreshPaneContent(true)
 		return nil
 	case "clear":
 		m.clearLocalPanes()
@@ -600,6 +630,7 @@ func (m *model) applyEvent(when time.Time, event copilotbridge.AppEvent) {
 		m.status = event.Status
 	case "assistant":
 		m.replaceLatestAssistant(event.Text)
+		m.pendingPrompt = false
 		m.status = event.Status
 	case "reasoning_delta":
 		m.appendReasoningDelta(event.Ref, event.Text)
@@ -628,6 +659,9 @@ func (m *model) applyEvent(when time.Time, event copilotbridge.AppEvent) {
 		m.cwd = event.Text
 		m.branch = event.Detail
 	case "status", "idle", "usage", "activity", "error":
+		if event.Kind == "idle" || event.Kind == "error" {
+			m.pendingPrompt = false
+		}
 		if event.Kind == "error" {
 			m.errorText = event.Text
 		}
@@ -835,6 +869,9 @@ func (m *model) restoreStoredSession(meta sessionstore.SessionMeta, events []ses
 	if meta.ApprovalPolicy != "" {
 		m.policy = meta.ApprovalPolicy
 		m.runtime.SetApprovalPolicy(meta.ApprovalPolicy)
+	} else {
+		m.policy = policyForMode(m.mode)
+		m.runtime.SetApprovalPolicy(m.policy)
 	}
 	m.transcript = nil
 	m.activity = nil
@@ -857,6 +894,27 @@ func (m *model) restoreStoredSession(meta sessionstore.SessionMeta, events []ses
 	}
 	m.status = "session loaded"
 	m.pendingPrompt = false
+}
+
+func (m *model) setModeDefaults(mode string) {
+	m.mode = mode
+	m.policy = policyForMode(mode)
+	m.runtime.SetMode(mode)
+	m.runtime.SetApprovalPolicy(m.policy)
+}
+
+func nextMode(current string) string {
+	if current == agents.ModeBuild {
+		return agents.ModePlan
+	}
+	return agents.ModeBuild
+}
+
+func policyForMode(mode string) state.ApprovalPolicy {
+	if mode == agents.ModePlan {
+		return state.ApprovalConservative
+	}
+	return state.ApprovalAllowAll
 }
 
 func (m *model) clearLocalPanes() {

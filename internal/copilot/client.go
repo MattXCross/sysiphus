@@ -289,7 +289,7 @@ func approvalHandler(policy state.ApprovalPolicy) copilot.PermissionHandlerFunc 
 				return copilot.PermissionRequestResult{Kind: copilot.PermissionRequestResultKindApproved}, nil
 			}
 		}
-		return copilot.PermissionRequestResult{Kind: copilot.PermissionRequestResultKindDeniedInteractivelyByUser}, nil
+		return copilot.PermissionRequestResult{Kind: copilot.PermissionRequestResultKindDeniedCouldNotRequestFromUser}, nil
 	}
 }
 
