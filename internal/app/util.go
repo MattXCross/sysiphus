@@ -29,6 +29,7 @@ func helpText() string {
 		"Shift+Up and Shift+Down scroll the activity pane one line\n" +
 		"Shift+PgUp and Shift+PgDn scroll the activity pane\n" +
 		"Mouse wheel scrolls the pane under the cursor\n" +
+		"Left click an execution header to collapse or expand its details\n" +
 		"Ctrl+N start a new session\n" +
 		"Ctrl+R resume the latest session\n" +
 		"Ctrl+P toggle plan/build mode for new sessions\n" +

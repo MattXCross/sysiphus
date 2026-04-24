@@ -69,17 +69,25 @@ func (m *model) layoutMetrics() (bodyHeight, leftWidth, rightWidth, rightTopHeig
 }
 
 func (m *model) renderTranscript() string {
-	var b strings.Builder
+	m.transcriptToggles = map[int]string{}
 	if len(m.transcript) == 0 {
-		b.WriteString(m.styles.muted.Render("No messages yet. Type a prompt and press Enter."))
-		return b.String()
+		return m.styles.muted.Render("No messages yet. Type a prompt and press Enter.")
 	}
 	contentWidth := max(20, m.transcriptVP.Width-2)
-	for _, item := range m.transcript {
-		b.WriteString(m.renderTranscriptEntry(item, contentWidth))
-		b.WriteString("\n\n")
+	units := m.renderTranscriptUnits(contentWidth)
+	parts := make([]string, 0, len(units))
+	lineNo := 1
+	for i, unit := range units {
+		parts = append(parts, unit.text)
+		if unit.toggleID != "" {
+			m.transcriptToggles[lineNo] = unit.toggleID
+		}
+		lineNo += lineCount(unit.text)
+		if i < len(units)-1 {
+			lineNo += 2
+		}
 	}
-	return strings.TrimSpace(b.String())
+	return strings.TrimSpace(strings.Join(parts, "\n\n"))
 }
 
 func (m *model) renderSidebar() string {
@@ -174,6 +182,135 @@ func (m *model) renderTranscriptEntry(item state.TranscriptEntry, width int) str
 	return strings.Join(parts, "\n")
 }
 
+type transcriptUnit struct {
+	text     string
+	toggleID string
+}
+
+func (m *model) renderTranscriptUnits(width int) []transcriptUnit {
+	units := make([]transcriptUnit, 0, len(m.transcript))
+	for i := 0; i < len(m.transcript); {
+		item := m.transcript[i]
+		groupID := m.executionGroupID(item)
+		if groupID == "" {
+			units = append(units, transcriptUnit{text: m.renderTranscriptEntry(item, width)})
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(m.transcript) && m.executionGroupID(m.transcript[j]) == groupID {
+			j++
+		}
+		units = append(units, transcriptUnit{text: m.renderExecutionBlock(groupID, m.transcript[i:j], width), toggleID: groupID})
+		i = j
+	}
+	return units
+}
+
+func (m *model) renderExecutionBlock(groupID string, items []state.TranscriptEntry, width int) string {
+	marker := "[-]"
+	if m.executionCollapsed(groupID) {
+		marker = "[+]"
+	}
+	label, labelStyle := m.executionBlockLabel(items)
+	summary := truncate(m.executionBlockSummary(items), max(12, width/2))
+	meta := []string{}
+	if !items[0].When.IsZero() {
+		meta = append(meta, items[0].When.Format("15:04:05"))
+	}
+	status := m.executionBlockStatus(items)
+	if status != "" && status != "ready" {
+		meta = append(meta, status)
+	}
+	meta = append(meta, fmt.Sprintf("%d events", len(items)))
+	header := fmt.Sprintf("%s %s %s", marker, labelStyle.Render(strings.ToUpper(label)), summary)
+	if len(meta) > 0 {
+		header += "  " + m.styles.muted.Render(strings.Join(meta, "  "))
+	}
+	if m.executionCollapsed(groupID) {
+		return header
+	}
+	parts := []string{header}
+	childWidth := max(16, width-2)
+	for _, item := range items {
+		parts = append(parts, indentBlock(m.renderTranscriptEntry(item, childWidth), "| "))
+	}
+	return strings.Join(parts, "\n")
+}
+
+func (m *model) executionGroupID(item state.TranscriptEntry) string {
+	if item.ID == "" {
+		return ""
+	}
+	switch item.Kind {
+	case "tool", "tool_progress", "tool_result", "permission", "subagent", "subagent_result", "subagent_failed":
+		if item.Kind == "subagent" && strings.HasPrefix(item.Text, "selected ") {
+			return ""
+		}
+		return item.ID
+	default:
+		return ""
+	}
+}
+
+func (m *model) executionBlockLabel(items []state.TranscriptEntry) (string, lipgloss.Style) {
+	for _, item := range items {
+		switch item.Kind {
+		case "subagent", "subagent_result", "subagent_failed":
+			if item.Status == "error" {
+				return "subagent", m.styles.error
+			}
+			return "subagent", m.styles.subagent
+		case "tool", "tool_progress", "tool_result", "permission":
+			if item.Status == "error" {
+				return "tool", m.styles.error
+			}
+			return "tool", m.styles.tool
+		}
+	}
+	return "execution", m.styles.section
+}
+
+func (m *model) executionBlockSummary(items []state.TranscriptEntry) string {
+	for _, item := range items {
+		if item.Kind == "tool" && item.Text != "" {
+			return item.Text
+		}
+	}
+	for _, item := range items {
+		if strings.HasPrefix(item.Kind, "subagent") && item.Text != "" {
+			return item.Text
+		}
+	}
+	for _, item := range items {
+		if item.Text != "" {
+			return item.Text
+		}
+	}
+	return "execution"
+}
+
+func (m *model) executionBlockStatus(items []state.TranscriptEntry) string {
+	status := ""
+	for _, item := range items {
+		switch item.Status {
+		case "error":
+			return "error"
+		case "blocked":
+			status = "blocked"
+		case "running":
+			if status == "" || status == "ready" {
+				status = "running"
+			}
+		case "ready":
+			if status == "" {
+				status = "ready"
+			}
+		}
+	}
+	return status
+}
+
 func (m *model) transcriptBody(item state.TranscriptEntry) string {
 	switch item.Kind {
 	case "tool_progress":
@@ -223,12 +360,40 @@ func (m *model) transcriptLabel(item state.TranscriptEntry) (string, lipgloss.St
 func (m *model) renderFooter() string {
 	inputFrameW, _ := m.styles.input.GetFrameSize()
 	input := m.styles.input.Width(max(1, m.width-inputFrameW)).Render(m.input.View())
-	hint := "Enter send  arrows transcript  Alt+Arrows info  Shift+Arrows activity  mouse wheel hovered pane  /quit exit"
+	hint := "Enter send  click execution headers collapse  arrows transcript  Alt+Arrows info  Shift+Arrows activity  /quit exit"
 	if m.commandHint != "" {
 		hint = m.commandHint
 	}
 	shortcuts := m.styles.muted.Render(truncate(hint, max(1, m.width)))
 	return lipgloss.JoinVertical(lipgloss.Left, input, shortcuts)
+}
+
+func (m *model) renderTranscriptPanel(outerWidth, outerHeight int) string {
+	frameW, frameH := m.styles.panel.GetFrameSize()
+	innerWidth := max(1, outerWidth-frameW)
+	innerHeight := max(1, outerHeight-frameH)
+	bodyHeight := max(1, innerHeight-2)
+	indicator := m.scrollIndicator(&m.transcriptVP)
+	left := m.styles.section.Render("Transcript")
+	indicatorText := truncate(indicator, max(1, innerWidth-lipgloss.Width(left)-1))
+	gapWidth := max(1, innerWidth-lipgloss.Width(left)-lipgloss.Width(indicatorText))
+	headerLine := left + strings.Repeat(" ", gapWidth) + m.styles.muted.Render(indicatorText)
+	header := lipgloss.NewStyle().Width(innerWidth).MaxWidth(innerWidth).Render(headerLine)
+	body := lipgloss.NewStyle().Width(innerWidth).Height(bodyHeight).Render(m.transcriptVP.View())
+	status := m.styles.transcriptStatus.Width(innerWidth).MaxWidth(innerWidth).Render(truncate(m.renderTranscriptStatusLine(), innerWidth))
+	return m.styles.panel.Render(lipgloss.JoinVertical(lipgloss.Left, header, body, status))
+}
+
+func (m *model) renderTranscriptStatusLine() string {
+	frame := sisyphusFrames[m.animationFrame%len(sisyphusFrames)]
+	if !m.isWorking() {
+		return frame + "  idle  click execution headers to expand or collapse details"
+	}
+	status := m.status
+	if status == "" {
+		status = "working"
+	}
+	return frame + "  " + status + "  sysiphus is still pushing"
 }
 
 func (m *model) renderViewportWithIndicator(title string, vp *viewport.Model, outerWidth, outerHeight int) string {
@@ -284,7 +449,7 @@ func (m *model) updatePaneRects() {
 		x:      1,
 		y:      headerHeight + 2,
 		width:  max(1, leftWidth-panelFrameW),
-		height: max(1, bodyHeight-panelFrameH-1),
+		height: max(1, bodyHeight-panelFrameH-2),
 	}
 	rightX := leftWidth + colGap + 1
 	m.infoRect = rect{
@@ -389,4 +554,28 @@ func truncate(text string, maxLen int) string {
 		return text
 	}
 	return string([]rune(text)[:maxLen-1]) + "…"
+}
+
+func indentBlock(text, prefix string) string {
+	lines := strings.Split(text, "\n")
+	for i := range lines {
+		lines[i] = prefix + lines[i]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func lineCount(text string) int {
+	if text == "" {
+		return 1
+	}
+	return strings.Count(text, "\n") + 1
+}
+
+var sisyphusFrames = []string{
+	" _o/  O",
+	" _o/ O ",
+	" _o/O  ",
+	" _o\\O  ",
+	" _o_\\O ",
+	" _o__\\O",
 }

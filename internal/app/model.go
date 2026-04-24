@@ -55,6 +55,9 @@ type model struct {
 	infoRect          rect
 	activityRect      rect
 	toolCalls         map[string]string
+	collapsedExecs    map[string]bool
+	transcriptToggles map[int]string
+	animationFrame    int
 	styles            styles
 }
 
@@ -71,6 +74,7 @@ func (r rect) contains(x, y int) bool {
 
 type runtimeEventMsg struct{ event copilotbridge.AppEvent }
 type runtimeStartedMsg struct{ err error }
+type animationTickMsg struct{}
 type sessionStartedMsg struct {
 	id                string
 	providerSessionID string
@@ -93,26 +97,28 @@ func New() tea.Model {
 	cwd, _ := os.Getwd()
 
 	return &model{
-		ctx:          ctx,
-		cancel:       cancel,
-		runtime:      copilotbridge.NewRuntime(),
-		store:        sessionstore.New(cwd),
-		input:        input,
-		transcriptVP: viewport.New(0, 0),
-		infoVP:       viewport.New(0, 0),
-		activityVP:   viewport.New(0, 0),
-		status:       "booting",
-		cwd:          cwd,
-		mode:         agents.ModeBuild,
-		policy:       state.ApprovalConservative,
-		modelName:    "gpt-5",
-		toolCalls:    map[string]string{},
-		styles:       defaultStyles(),
+		ctx:               ctx,
+		cancel:            cancel,
+		runtime:           copilotbridge.NewRuntime(),
+		store:             sessionstore.New(cwd),
+		input:             input,
+		transcriptVP:      viewport.New(0, 0),
+		infoVP:            viewport.New(0, 0),
+		activityVP:        viewport.New(0, 0),
+		status:            "booting",
+		cwd:               cwd,
+		mode:              agents.ModeBuild,
+		policy:            state.ApprovalConservative,
+		modelName:         "gpt-5",
+		toolCalls:         map[string]string{},
+		collapsedExecs:    map[string]bool{},
+		transcriptToggles: map[int]string{},
+		styles:            defaultStyles(),
 	}
 }
 
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(m.startRuntimeCmd(), m.waitForRuntimeEvent())
+	return tea.Batch(m.startRuntimeCmd(), m.waitForRuntimeEvent(), m.animationTickCmd())
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -206,6 +212,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "send failed"
 		}
 		m.refreshPaneContent(true)
+	case animationTickMsg:
+		if m.isWorking() {
+			m.animationFrame = (m.animationFrame + 1) % len(sisyphusFrames)
+			m.refreshPaneContent(false)
+		}
+		return m, m.animationTickCmd()
 	case tea.KeyMsg:
 		if m.showModelPicker {
 			return m.updateModelPicker(msg)
@@ -293,6 +305,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+l":
 			m.transcript = nil
 			m.activity = nil
+			m.toolCalls = map[string]string{}
+			m.collapsedExecs = map[string]bool{}
+			m.transcriptToggles = map[int]string{}
 			m.errorText = ""
 			m.refreshPaneContent(false)
 			return m, nil
@@ -335,9 +350,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	if mouseMsg, ok := msg.(tea.MouseMsg); ok && (mouseMsg.Button == tea.MouseButtonWheelUp || mouseMsg.Button == tea.MouseButtonWheelDown) {
-		m.scrollViewportAt(mouseMsg.X, mouseMsg.Y, mouseMsg.Button == tea.MouseButtonWheelUp)
-		return m, nil
+	if mouseMsg, ok := msg.(tea.MouseMsg); ok {
+		if mouseMsg.Button == tea.MouseButtonWheelUp || mouseMsg.Button == tea.MouseButtonWheelDown {
+			m.scrollViewportAt(mouseMsg.X, mouseMsg.Y, mouseMsg.Button == tea.MouseButtonWheelUp)
+			return m, nil
+		}
+		if mouseMsg.Button == tea.MouseButtonLeft && m.toggleTranscriptBlockAt(mouseMsg.X, mouseMsg.Y) {
+			m.refreshPaneContent(false)
+			return m, nil
+		}
 	}
 
 	m.input, cmd = m.input.Update(msg)
@@ -354,7 +375,7 @@ func (m *model) View() string {
 	header := m.renderHeader()
 	bodyHeight, leftWidth, rightWidth, rightTopHeight, rightBottomHeight := m.layoutMetrics()
 
-	left := m.renderViewportWithIndicator("Transcript", &m.transcriptVP, leftWidth, bodyHeight)
+	left := m.renderTranscriptPanel(leftWidth, bodyHeight)
 	rightTop := m.renderInfoPanel(rightWidth, rightTopHeight)
 	rightBottom := m.renderViewportWithIndicator("Activity", &m.activityVP, rightWidth, rightBottomHeight)
 	right := lipgloss.JoinVertical(lipgloss.Left, rightTop, rightBottom)
@@ -555,6 +576,12 @@ func (m *model) waitForRuntimeEvent() tea.Cmd {
 	}
 }
 
+func (m *model) animationTickCmd() tea.Cmd {
+	return tea.Tick(160*time.Millisecond, func(time.Time) tea.Msg {
+		return animationTickMsg{}
+	})
+}
+
 func (m *model) consumeRuntimeEvent(event copilotbridge.AppEvent) {
 	m.applyEvent(time.Now(), event)
 	if event.Session != "" {
@@ -684,7 +711,7 @@ func (m *model) resizeViewports() {
 	bodyHeight, leftWidth, rightWidth, rightTopHeight, rightBottomHeight := m.layoutMetrics()
 	panelFrameW, panelFrameH := m.styles.panel.GetFrameSize()
 	m.transcriptVP.Width = max(1, leftWidth-panelFrameW)
-	m.transcriptVP.Height = max(1, bodyHeight-panelFrameH-1)
+	m.transcriptVP.Height = max(1, bodyHeight-panelFrameH-2)
 	m.infoVP.Width = max(1, rightWidth-panelFrameW)
 	m.infoVP.Height = max(1, rightTopHeight-panelFrameH-1)
 	m.activityVP.Width = max(1, rightWidth-panelFrameW)
@@ -809,6 +836,8 @@ func (m *model) restoreStoredSession(meta sessionstore.SessionMeta, events []ses
 	m.transcript = nil
 	m.activity = nil
 	m.toolCalls = map[string]string{}
+	m.collapsedExecs = map[string]bool{}
+	m.transcriptToggles = map[int]string{}
 	for _, event := range events {
 		m.applyEvent(event.Timestamp, copilotbridge.AppEvent{
 			Kind:    event.Kind,
@@ -823,6 +852,38 @@ func (m *model) restoreStoredSession(meta sessionstore.SessionMeta, events []ses
 		}
 	}
 	m.status = "session loaded"
+}
+
+func (m *model) toggleTranscriptBlockAt(x, y int) bool {
+	if !m.transcriptRect.contains(x, y) {
+		return false
+	}
+	line := m.transcriptVP.YOffset + (y - m.transcriptRect.y) + 1
+	groupID := m.transcriptToggles[line]
+	if groupID == "" {
+		return false
+	}
+	m.collapsedExecs[groupID] = !m.executionCollapsed(groupID)
+	return true
+}
+
+func (m *model) executionCollapsed(groupID string) bool {
+	if collapsed, ok := m.collapsedExecs[groupID]; ok {
+		return collapsed
+	}
+	for _, item := range m.transcript {
+		if m.executionGroupID(item) != groupID {
+			continue
+		}
+		if item.Status == "running" || item.Status == "blocked" || item.Status == "error" {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *model) isWorking() bool {
+	return m.pendingPrompt || m.status == "sending" || m.status == "running" || m.status == "blocked"
 }
 
 func (m *model) scrollHoveredViewport(up bool) {
