@@ -1,5 +1,7 @@
 # sysiphus
 
+<img width="1907" height="1053" alt="image" src="https://github.com/user-attachments/assets/a17a57b3-2296-4ed5-a5b5-318ac75b2a68" />
+
 `sysiphus` is a Go + Bubble Tea terminal coding agent that uses GitHub Copilot's Go SDK as its runtime.
 
 ## Current MVP
